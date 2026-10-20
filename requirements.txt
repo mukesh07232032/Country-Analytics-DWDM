@@ -1,0 +1,11 @@
+# Core ETL & API HTTP Client
+requests>=2.31.0
+
+# Configuration Management
+python-dotenv>=1.0.1
+
+# PostgreSQL Driver
+psycopg2-binary>=2.9.9
+
+# Testing Framework
+pytest>=8.0.0

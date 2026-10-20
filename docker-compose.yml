@@ -1,0 +1,223 @@
+# ==============================================================================
+# Country Analytics - Docker Compose Specification
+# ==============================================================================
+# Orchestrates PostgreSQL, Apache Airflow (LocalExecutor), Metabase, and pgAdmin.
+# Services communicate over the isolated bridge network: country_analytics_net.
+# ==============================================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ${AIRFLOW_IMAGE_NAME:-country-analytics-airflow:2.9.3-python3.12}
+  environment:
+    # Airflow Core & Database Configuration
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    PYTHONPATH: /opt/airflow
+
+    # Project & ETL Pipeline Configuration
+    REST_COUNTRIES_API_KEY: ${REST_COUNTRIES_API_KEY}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_DB: ${POSTGRES_DB:-country_analytics}
+    POSTGRES_USER: ${POSTGRES_USER:-airflow}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./etl.py:/opt/airflow/etl.py:ro
+    - ./plugins:/opt/airflow/plugins:ro
+    - airflow_logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - country_analytics_net
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. PostgreSQL Service
+  # Hosts the business analytics database (country_analytics) and Airflow metadata (airflow).
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: country_analytics_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-country_analytics}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d ${POSTGRES_DB:-country_analytics}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - country_analytics_net
+
+  # ----------------------------------------------------------------------------
+  # 2. Airflow Initialization Service
+  # Runs schema migrations and creates the admin user, then terminates.
+  # ----------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: country_analytics_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Waiting for PostgreSQL and verifying Airflow metadata database..."
+        python -c "
+        import psycopg2, time
+        while True:
+            try:
+                conn = psycopg2.connect(
+                    host='postgres',
+                    user='${POSTGRES_USER:-airflow}',
+                    password='${POSTGRES_PASSWORD}',
+                    dbname='${POSTGRES_DB:-country_analytics}'
+                )
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute(\"SELECT 1 FROM pg_database WHERE datname = 'airflow'\")
+                if not cur.fetchone():
+                    cur.execute('CREATE DATABASE airflow;')
+                    print('Database airflow created successfully.')
+                cur.close()
+                conn.close()
+                break
+            except Exception as e:
+                print('Waiting for postgres to be ready...', e)
+                time.sleep(2)
+        "
+        echo "Running Airflow database migrations..."
+        airflow db migrate
+        echo "Configuring Airflow administrator user..."
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --firstname "${_AIRFLOW_WWW_USER_FIRSTNAME:-Airflow}" \
+          --lastname "${_AIRFLOW_WWW_USER_LASTNAME:-Admin}" \
+          --role Admin \
+          --email "${_AIRFLOW_WWW_USER_EMAIL:-admin@example.com}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" || true
+        echo "Airflow initialization complete."
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # 3. Airflow Webserver
+  # Provides the Airflow monitoring and scheduling web interface.
+  # ----------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: country_analytics_airflow_webserver
+    restart: unless-stopped
+    command: airflow webserver
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------------------------
+  # 4. Airflow Scheduler
+  # Monitors DAG definitions and triggers the scheduled Country Analytics ETL pipeline.
+  # ----------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: country_analytics_airflow_scheduler
+    restart: unless-stopped
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------------------------
+  # 5. Metabase BI Dashboard
+  # Interactive visualization and dashboarding tool.
+  # Uses internal persistent storage for its own app configuration,
+  # connecting to the PostgreSQL container as an external data source.
+  # ----------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:latest
+    container_name: country_analytics_metabase
+    restart: unless-stopped
+    ports:
+      - "${METABASE_PORT:-3000}:3000"
+    volumes:
+      - metabase_data:/metabase-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - country_analytics_net
+
+  # ----------------------------------------------------------------------------
+  # 6. pgAdmin Database Management UI
+  # Web interface for inspecting, querying, and managing the PostgreSQL database.
+  # ----------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: country_analytics_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - country_analytics_net
+
+# ==============================================================================
+# Persistent Named Volumes
+# ==============================================================================
+volumes:
+  postgres_data:
+    name: country_analytics_postgres_data
+  airflow_logs:
+    name: country_analytics_airflow_logs
+  metabase_data:
+    name: country_analytics_metabase_data
+  pgadmin_data:
+    name: country_analytics_pgadmin_data
+
+# ==============================================================================
+# Isolated Internal Network
+# ==============================================================================
+networks:
+  country_analytics_net:
+    name: country_analytics_net
+    driver: bridge

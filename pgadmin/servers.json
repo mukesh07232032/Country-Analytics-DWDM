@@ -1,0 +1,13 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "PostgreSQL (Country Analytics)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "country_analytics",
+      "Username": "airflow",
+      "SSLMode": "prefer"
+    }
+  }
+}
